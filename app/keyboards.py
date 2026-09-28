@@ -31,7 +31,12 @@ def accounts_kb(accounts):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def destinations_kb(destinations):
-    rows = [[InlineKeyboardButton(text=f"📍 {d.title}", callback_data=f"dest:{d.id}")] for d in destinations]
+    rows = []
+    for d in destinations:
+        action = "⏸️ إيقاف" if d.active else "▶️ إرجاع"
+        rows.append([InlineKeyboardButton(text=f"📍 {d.title}", callback_data=f"destinfo:{d.id}"),
+                     InlineKeyboardButton(text=action, callback_data=f"dest_toggle:{d.id}")])
+        rows.append([InlineKeyboardButton(text="🔄 تحديث بيانات الكروب", callback_data=f"dest_refresh:{d.id}")])
     rows.append([InlineKeyboardButton(text="➕ إضافة كروب", callback_data="dest_add")])
     rows.append([InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

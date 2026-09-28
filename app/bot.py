@@ -161,10 +161,21 @@ async def account_title(message, state, session, settings):
 async def destinations(call, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
     rows = (await session.execute(
-        select(Destination).where(Destination.owner_user_id == u.id, Destination.active == True)
+        select(Destination).where(Destination.owner_user_id == u.id).order_by(Destination.id.asc())
     )).scalars().all()
     await call.answer()
-    await call.message.edit_text("📍 الكروبات المحفوظة:", reply_markup=destinations_kb(rows))
+    if not rows:
+        text = "📍 لا توجد كروبات محفوظة.\n\nأضف كروب حتى يظهر هنا."
+    else:
+        active = sum(1 for d in rows if d.active)
+        paused = len(rows) - active
+        text = (
+            "📍 أماكن النشر\n\n"
+            f"🟢 مفعّلة: {active} | ⏸️ متوقفة: {paused}\n\n"
+            "اضغط ⏸️ لإزالة الكروب مؤقتاً، واضغط ▶️ لإرجاعه بأي وقت.\n"
+            "🔄 تحديث بيانات الكروب يصلح الوجهات القديمة أيضاً."
+        )
+    await call.message.edit_text(text, reply_markup=destinations_kb(rows))
 
 @router.callback_query(F.data == "dest_add")
 async def dest_add(call, state, session, settings):
@@ -177,6 +188,7 @@ async def dest_add(call, state, session, settings):
     rows = [[InlineKeyboardButton(text=a.title, callback_data=f"dacc:{a.id}")] for a in accts]
     rows.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
     await state.set_state(DestFlow.account)
+    await call.answer()
     await call.message.edit_text("اختر الحساب الذي ينتمي للكروب:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("dacc:"))
@@ -185,8 +197,9 @@ async def dest_account(call, state):
     await state.update_data(account_id=int(call.data.split(":")[1]))
     await state.set_state(DestFlow.chat)
     await call.message.edit_text(
-        "📍 أرسل @username للكروب أو chat_id.\n"
-        "إذا الكروب خاص وما عنده username، أرسل الـ chat_id."
+        "📍 أرسل @username للكروب.\n"
+        "وللكروب الخاص أرسل chat_id إذا كان معروفاً.\n\n"
+        "سيتم حفظ بيانات Telegram الداخلية للكروب حتى يقدر الحساب ينشر فيه لاحقاً."
     )
 
 @router.message(DestFlow.chat)
@@ -203,15 +216,97 @@ async def dest_chat(message, state, session, settings):
         cid, title = await TelegramService(settings, settings.cipher).resolve_group(
             a.encrypted_session, (message.text or "").strip()
         )
-        session.add(Destination(
-            owner_user_id=u.id, account_id=a.id, chat_id=cid, title=title
-        ))
+        existing = (await session.execute(select(Destination).where(
+            Destination.owner_user_id == u.id,
+            Destination.account_id == a.id,
+            Destination.chat_id == cid
+        ))).scalar_one_or_none()
+        if existing:
+            existing.title = title
+            existing.active = True
+        else:
+            session.add(Destination(
+                owner_user_id=u.id, account_id=a.id, chat_id=cid, title=title, active=True
+            ))
         await session.commit()
     except Exception as e:
         await session.rollback()
         return await message.answer(f"❌ لم أستطع حفظ الكروب.\n{e}")
     await state.clear()
-    await message.answer(f"✅ تم حفظ الكروب: {title}", reply_markup=main_menu(u.role == "owner"))
+    await message.answer(f"✅ تم حفظ الكروب: {title}\n\nتقدر توقفه أو ترجعه من 📍 أماكن النشر.", reply_markup=main_menu(u.role == "owner"))
+
+@router.callback_query(F.data.startswith("dest_toggle:"))
+async def dest_toggle(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    did = int(call.data.split(":")[1])
+    dest = (await session.execute(select(Destination).where(
+        Destination.id == did, Destination.owner_user_id == u.id
+    ))).scalar_one_or_none()
+    if not dest:
+        return await call.answer("الكروب غير موجود.", show_alert=True)
+    dest.active = not dest.active
+    await session.commit()
+    await call.answer("▶️ تم إرجاع الكروب" if dest.active else "⏸️ تم إيقاف الكروب")
+    rows = (await session.execute(
+        select(Destination).where(Destination.owner_user_id == u.id).order_by(Destination.id.asc())
+    )).scalars().all()
+    await call.message.edit_text(
+        "📍 أماكن النشر\n\n"
+        "اضغط ⏸️ لإزالة الكروب مؤقتاً، واضغط ▶️ لإرجاعه بأي وقت.\n"
+        "🔄 تحديث بيانات الكروب يصلح الوجهات القديمة أيضاً.",
+        reply_markup=destinations_kb(rows)
+    )
+
+@router.callback_query(F.data.startswith("dest_refresh:"))
+async def dest_refresh(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    did = int(call.data.split(":")[1])
+    dest = (await session.execute(select(Destination).where(
+        Destination.id == did, Destination.owner_user_id == u.id
+    ))).scalar_one_or_none()
+    if not dest:
+        return await call.answer("الكروب غير موجود.", show_alert=True)
+    acct = (await session.execute(select(TelegramAccount).where(
+        TelegramAccount.id == dest.account_id, TelegramAccount.owner_user_id == u.id, TelegramAccount.active == True
+    ))).scalar_one_or_none()
+    if not acct:
+        return await call.answer("حساب Telegram المرتبط غير موجود أو متوقف.", show_alert=True)
+    await call.answer("🔄 جاري تحديث بيانات الكروب...")
+    try:
+        new_ref, title = await TelegramService(settings, settings.cipher).refresh_saved_group(
+            acct.encrypted_session, dest.chat_id
+        )
+        dest.chat_id = new_ref
+        dest.title = title
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        return await call.answer(f"تعذر تحديث الكروب: {type(e).__name__}", show_alert=True)
+    rows = (await session.execute(
+        select(Destination).where(Destination.owner_user_id == u.id).order_by(Destination.id.asc())
+    )).scalars().all()
+    await call.message.edit_text(
+        f"✅ تم تحديث بيانات: {title}\n\n"
+        "تقدر توقفه أو ترجعه بأي وقت من الأزرار أدناه.",
+        reply_markup=destinations_kb(rows)
+    )
+
+@router.callback_query(F.data.startswith("destinfo:"))
+async def dest_info(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    did = int(call.data.split(":")[1])
+    dest = (await session.execute(select(Destination).where(
+        Destination.id == did, Destination.owner_user_id == u.id
+    ))).scalar_one_or_none()
+    if not dest:
+        return await call.answer("الكروب غير موجود.", show_alert=True)
+    await call.answer()
+    state = "🟢 مفعّل" if dest.active else "⏸️ متوقف"
+    await call.message.edit_text(
+        f"📍 {dest.title}\n\nالحالة: {state}\nرقم الحفظ: #{dest.id}\n\n"
+        "زر الإيقاف/الإرجاع يتحكم باستخدام الكروب في المنشورات الجديدة والجدولات.",
+        reply_markup=destinations_kb([dest])
+    )
 
 # ---------- Persistent drafts/posts ----------
 @router.callback_query(F.data == "post_add")

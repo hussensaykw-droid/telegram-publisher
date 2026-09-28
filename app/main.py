@@ -32,17 +32,25 @@ async def publish_due(bot, session_factory, settings, cipher):
                 sch.active = False
                 await s.commit(); continue
             tmp = None
+            published_any = False
             try:
-                if post.media_file_id:
-                    f = await bot.get_file(post.media_file_id)
-                    fd, tmp = tempfile.mkstemp(suffix='.jpg'); os.close(fd)
-                    await bot.download_file(f.file_path, tmp)
-                svc = TelegramService(settings, cipher)
-                for d in dests:
-                    await svc.publish(acct.encrypted_session, d.chat_id, post.text, tmp)
-                    await asyncio.sleep(1)
-                if cfg:
-                    cfg.published_count += 1
+                if not dests:
+                    logging.warning('schedule %s has no active destinations; waiting for one to be enabled', sch.id)
+                else:
+                    if post.media_file_id:
+                        f = await bot.get_file(post.media_file_id)
+                        fd, tmp = tempfile.mkstemp(suffix='.jpg'); os.close(fd)
+                        await bot.download_file(f.file_path, tmp)
+                    svc = TelegramService(settings, cipher)
+                    for d in dests:
+                        try:
+                            await svc.publish(acct.encrypted_session, d.chat_id, post.text, tmp)
+                            published_any = True
+                            await asyncio.sleep(1)
+                        except Exception:
+                            logging.exception('destination publish failed for schedule %s, destination %s (%s)', sch.id, d.id, d.title)
+                    if published_any and cfg:
+                        cfg.published_count += 1
             except Exception:
                 logging.exception('scheduled publish failed for schedule %s', sch.id)
             finally:
