@@ -3,7 +3,8 @@ from sqlalchemy import String, BigInteger, Boolean, DateTime, Text, ForeignKey, 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-class Base(DeclarativeBase): pass
+class Base(DeclarativeBase):
+    pass
 
 class User(Base):
     __tablename__ = "users"
@@ -53,6 +54,16 @@ class Schedule(Base):
     post_id: Mapped[int] = mapped_column(ForeignKey("posts.id"), index=True)
     interval_minutes: Mapped[int] = mapped_column(Integer, default=0)
     next_run_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+# New table: survives alongside the old schema without requiring an ALTER.
+class Draft(Base):
+    __tablename__ = "drafts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 async def init_db(url: str):
