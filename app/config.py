@@ -1,10 +1,8 @@
 import os
 from dataclasses import dataclass
-from dotenv import load_dotenv
+from .security import SessionCipher
 
-load_dotenv()
-
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     bot_token: str
     api_id: int

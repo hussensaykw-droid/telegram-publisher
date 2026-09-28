@@ -1,7 +1,18 @@
 from aiogram.fsm.state import State, StatesGroup
+
 class AccountFlow(StatesGroup):
-    phone=State(); code=State(); password=State(); title=State()
+    phone = State()
+    code = State()
+    password = State()
+    title = State()
+
 class DestFlow(StatesGroup):
-    account=State(); chat=State()
+    account = State()
+    chat = State()
+
 class PostFlow(StatesGroup):
-    content=State(); account=State(); destinations=State(); when=State(); repeat=State()
+    draft = State()
+    account = State()
+    destinations = State()
+    when = State()
+    repeat = State()
