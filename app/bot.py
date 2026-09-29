@@ -316,6 +316,56 @@ async def dest_refresh(call, session, settings):
         reply_markup=destinations_kb(rows)
     )
 
+
+@router.callback_query(F.data.startswith("dest_delete:"))
+async def dest_delete(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    did = int(call.data.split(":")[1])
+    dest = (await session.execute(select(Destination).where(
+        Destination.id == did, Destination.owner_user_id == u.id
+    ))).scalar_one_or_none()
+    if not dest:
+        return await call.answer("الكروب غير موجود.", show_alert=True)
+
+    # Remove the destination from saved posts, but keep the posts themselves
+    # so the existing edit/delete features continue to work.
+    links = (await session.execute(
+        select(PostDestination).where(PostDestination.destination_id == dest.id)
+    )).scalars().all()
+    affected_post_ids = [x.post_id for x in links]
+    for link in links:
+        await session.delete(link)
+    await session.flush()
+
+    # If a post no longer has any destination, pause its schedules rather than
+    # letting the scheduler repeatedly retry a schedule with nowhere to publish.
+    for pid in affected_post_ids:
+        remaining = (await session.execute(
+            select(PostDestination).join(Destination, PostDestination.destination_id == Destination.id).where(
+                PostDestination.post_id == pid, Destination.active == True
+            )
+        )).scalars().first()
+        if remaining is None:
+            schedules = (await session.execute(
+                select(Schedule).where(Schedule.post_id == pid, Schedule.active == True)
+            )).scalars().all()
+            for sch in schedules:
+                sch.active = False
+
+    title = dest.title
+    await session.delete(dest)
+    await session.commit()
+    await call.answer("🗑️ تم حذف الكروب")
+    rows = (await session.execute(
+        select(Destination).where(Destination.owner_user_id == u.id).order_by(Destination.id.asc())
+    )).scalars().all()
+    text = "📍 أماكن النشر\n\n🗑️ تم حذف الكروب: " + title
+    if rows:
+        text += "\n\nتقدر تضيف كروبات جديدة أو توقف/ترجع أي كروب."
+    else:
+        text += "\n\n📭 لا توجد كروبات محفوظة."
+    await call.message.edit_text(text, reply_markup=destinations_kb(rows))
+
 @router.callback_query(F.data.startswith("destinfo:"))
 async def dest_info(call, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
@@ -530,17 +580,35 @@ async def users(call, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
     if u.role != "owner":
         return await call.answer("غير مصرح", show_alert=True)
+    await call.answer()
+    await _render_users(call, session, settings)
+
+async def _render_users(call, session, settings):
     pending = (await session.execute(select(User).where(
         User.active == False, User.role == "user"
-    ))).scalars().all()
-    if not pending:
-        return await call.message.edit_text("👥 لا توجد طلبات دخول معلّقة.", reply_markup=back())
-    for x in pending:
-        await call.message.answer(
-            f"👤 طلب دخول جديد\nID: <code>{x.telegram_id}</code>",
-            reply_markup=approval_kb(x.telegram_id)
-        )
-    await call.answer()
+    ).order_by(User.id.asc()))).scalars().all()
+    active = (await session.execute(select(User).where(
+        User.active == True, User.role == "user"
+    ).order_by(User.id.asc()))).scalars().all()
+    blocked = (await session.execute(select(User).where(
+        User.active == False, User.role == "user"
+    ).order_by(User.id.asc()))).scalars().all()
+
+    lines = ["👥 المستخدمون", "", f"🟢 مفعّلين: {len(active)}", f"⏳ بانتظار الموافقة: {len(pending)}", ""]
+    if active:
+        lines.append("🟢 المستخدمون المفعّلون:")
+        lines.extend(f"• {x.telegram_id}" for x in active)
+    if pending:
+        lines.append("\n⏳ طلبات الدخول:")
+        lines.extend(f"• {x.telegram_id}" for x in pending)
+    if not active and not pending:
+        lines.append("لا يوجد مستخدمون حالياً.")
+    lines.append("\nيمكنك إزالة صلاحية أي مستخدم، وإرجاعه لاحقاً.")
+    await call.message.edit_text("\n".join(lines), reply_markup=users_manage_kb(active, pending, settings.owner_id))
+
+@router.callback_query(F.data.startswith("user_noop:"))
+async def user_noop(call):
+    await call.answer("هذا هو Telegram ID للمستخدم.")
 
 @router.callback_query(F.data.startswith("user_accept:"))
 async def user_accept(call, session, settings):
@@ -553,12 +621,12 @@ async def user_accept(call, session, settings):
         return await call.answer("المستخدم غير موجود", show_alert=True)
     target.active = True
     await session.commit()
-    await call.answer("تم قبول المستخدم")
+    await call.answer("✅ تم إبقاء/تفعيل المستخدم")
     try:
         await call.bot.send_message(tid, "✅ تمت الموافقة على دخولك للبوت.")
     except Exception:
         pass
-    await call.message.edit_text(f"✅ تم قبول المستخدم {tid}")
+    await _render_users(call, session, settings)
 
 @router.callback_query(F.data.startswith("user_reject:"))
 async def user_reject(call, session, settings):
@@ -569,7 +637,48 @@ async def user_reject(call, session, settings):
     target = (await session.execute(select(User).where(User.telegram_id == tid))).scalar_one_or_none()
     if not target:
         return await call.answer("المستخدم غير موجود", show_alert=True)
-    await session.delete(target)
+    target.active = False
     await session.commit()
-    await call.answer("تم رفض الطلب")
-    await call.message.edit_text(f"❌ تم رفض المستخدم {tid}")
+    await call.answer("❌ تم رفض الطلب")
+    await _render_users(call, session, settings)
+
+@router.callback_query(F.data.startswith("user_remove:"))
+async def user_remove(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    if u.role != "owner":
+        return await call.answer("غير مصرح", show_alert=True)
+    tid = int(call.data.split(":")[1])
+    target = (await session.execute(select(User).where(
+        User.telegram_id == tid, User.role == "user"
+    ))).scalar_one_or_none()
+    if not target:
+        return await call.answer("المستخدم غير موجود", show_alert=True)
+    target.active = False
+    await session.commit()
+    await call.answer("🚫 تم إيقاف دخول المستخدم")
+    try:
+        await call.bot.send_message(tid, "🚫 تم إيقاف صلاحيتك لاستخدام البوت. إذا أردت العودة، اطلب من المالك تفعيلك.")
+    except Exception:
+        pass
+    await _render_users(call, session, settings)
+
+@router.callback_query(F.data.startswith("user_restore:"))
+async def user_restore(call, session, settings):
+    u = await get_user(session, call.from_user.id, settings.owner_id)
+    if u.role != "owner":
+        return await call.answer("غير مصرح", show_alert=True)
+    tid = int(call.data.split(":")[1])
+    target = (await session.execute(select(User).where(
+        User.telegram_id == tid, User.role == "user"
+    ))).scalar_one_or_none()
+    if not target:
+        return await call.answer("المستخدم غير موجود", show_alert=True)
+    target.active = True
+    await session.commit()
+    await call.answer("♻️ تم إبقاء/إرجاع المستخدم")
+    try:
+        await call.bot.send_message(tid, "♻️ تم تفعيل صلاحيتك لاستخدام البوت من جديد.")
+    except Exception:
+        pass
+    await _render_users(call, session, settings)
+
