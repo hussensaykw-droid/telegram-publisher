@@ -1,7 +1,18 @@
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    UnauthorizedError,
+)
 from telethon.tl.types import InputPeerChannel, InputPeerChat, Channel, Chat
+
+class TelegramSessionInvalid(Exception):
+    """Stored Telegram session is no longer authorized."""
+
 
 class TelegramService:
     def __init__(self, settings, cipher):
@@ -43,13 +54,19 @@ class TelegramService:
         return me, session
 
     async def check_session(self, encrypted):
-        session = self.cipher.decrypt(encrypted)
-        c = self.client(session)
-        await c.connect()
         try:
-            return await c.get_me()
-        finally:
-            await c.disconnect()
+            session = self.cipher.decrypt(encrypted)
+            c = self.client(session)
+            await c.connect()
+            try:
+                me = await c.get_me()
+                if me is None:
+                    raise TelegramSessionInvalid("Telegram session is no longer authorized")
+                return me
+            finally:
+                await c.disconnect()
+        except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError, UserDeactivatedBanError, UnauthorizedError) as e:
+            raise TelegramSessionInvalid("Telegram session is no longer authorized") from e
 
     @staticmethod
     def encode_entity(ent):
@@ -109,30 +126,33 @@ class TelegramService:
             await c.disconnect()
 
     async def publish(self, encrypted, chat_id, text=None, local_file=None):
-        session = self.cipher.decrypt(encrypted)
-        c = self.client(session)
-        await c.connect()
         try:
-            ref = str(chat_id or "").strip()
-            peer = None
-            if ref.startswith("channel:"):
-                _, cid, access_hash = ref.split(":", 2)
-                peer = InputPeerChannel(int(cid), int(access_hash))
-            elif ref.startswith("chat:"):
-                _, cid = ref.split(":", 1)
-                peer = InputPeerChat(int(cid))
-            else:
-                # Backward compatibility for destinations saved before entity refs.
-                target = int(ref)
-                async for dialog in c.iter_dialogs():
-                    e = dialog.entity
-                    if getattr(e, "id", None) == target:
-                        peer = e
-                        break
-                if peer is None:
-                    raise ValueError(f'Cannot find any entity corresponding to "{ref}"')
-            if local_file:
-                return await c.send_file(peer, local_file, caption=text or "")
-            return await c.send_message(peer, text or "")
-        finally:
-            await c.disconnect()
+            session = self.cipher.decrypt(encrypted)
+            c = self.client(session)
+            await c.connect()
+            try:
+                ref = str(chat_id or "").strip()
+                peer = None
+                if ref.startswith("channel:"):
+                    _, cid, access_hash = ref.split(":", 2)
+                    peer = InputPeerChannel(int(cid), int(access_hash))
+                elif ref.startswith("chat:"):
+                    _, cid = ref.split(":", 1)
+                    peer = InputPeerChat(int(cid))
+                else:
+                    # Backward compatibility for destinations saved before entity refs.
+                    target = int(ref)
+                    async for dialog in c.iter_dialogs():
+                        e = dialog.entity
+                        if getattr(e, "id", None) == target:
+                            peer = e
+                            break
+                    if peer is None:
+                        raise ValueError(f'Cannot find any entity corresponding to "{ref}"')
+                if local_file:
+                    return await c.send_file(peer, local_file, caption=text or "")
+                return await c.send_message(peer, text or "")
+            finally:
+                await c.disconnect()
+        except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError, UserDeactivatedBanError, UnauthorizedError) as e:
+            raise TelegramSessionInvalid("Telegram session is no longer authorized") from e

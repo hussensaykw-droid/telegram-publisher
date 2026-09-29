@@ -13,7 +13,8 @@ from .db import init_db, Schedule, ScheduleConfig, Post, PostDestination, Destin
 from .security import SessionCipher
 from .bot import router
 from .schedule_ui import router as schedule_router
-from .services import TelegramService
+from .services import TelegramService, TelegramSessionInvalid
+from .account_guard import invalidate_account
 logging.basicConfig(level=logging.INFO)
 
 async def publish_due(bot, session_factory, settings, cipher):
@@ -47,6 +48,10 @@ async def publish_due(bot, session_factory, settings, cipher):
                             await svc.publish(acct.encrypted_session, d.chat_id, post.text, tmp)
                             published_any = True
                             await asyncio.sleep(1)
+                        except TelegramSessionInvalid:
+                            logging.warning('telegram session revoked for account %s; removing stored login and stopping its schedules', acct.id)
+                            await invalidate_account(s, acct)
+                            break
                         except Exception:
                             logging.exception('destination publish failed for schedule %s, destination %s (%s)', sch.id, d.id, d.title)
                     if published_any and cfg:
@@ -57,6 +62,10 @@ async def publish_due(bot, session_factory, settings, cipher):
                 if tmp:
                     try: os.remove(tmp)
                     except OSError: pass
+            if not acct.active:
+                sch.active = False
+                await s.commit()
+                continue
             if cfg:
                 if cfg.publish_limit > 0 and cfg.published_count >= cfg.publish_limit:
                     sch.active = False

@@ -9,6 +9,7 @@ from .db import User, TelegramAccount, Destination, Post, PostDestination, Sched
 from .keyboards import *
 from .states import AccountFlow, DestFlow, PostFlow
 from .services import TelegramService
+from .account_guard import validate_account, invalidate_account
 
 router = Router()
 
@@ -28,6 +29,33 @@ async def get_user(session, tid, owner):
         session.add(u)
         await session.commit()
     return u
+
+async def valid_accounts(session, u, settings):
+    accounts = (await session.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.owner_user_id == u.id,
+            TelegramAccount.active == True
+        )
+    )).scalars().all()
+    valid = []
+    removed = 0
+    for account in accounts:
+        if await validate_account(session, account, settings):
+            valid.append(account)
+        else:
+            removed += 1
+    return valid, removed
+
+async def get_valid_account(session, u, account_id, settings):
+    account = (await session.execute(select(TelegramAccount).where(
+        TelegramAccount.id == account_id,
+        TelegramAccount.owner_user_id == u.id,
+        TelegramAccount.active == True
+    ))).scalar_one_or_none()
+    if not account:
+        return None, False
+    ok = await validate_account(session, account, settings)
+    return (account if ok else None), (not ok)
 
 async def home(message, session, settings):
     u = await get_user(session, message.from_user.id, settings.owner_id)
@@ -71,14 +99,10 @@ async def accounts(call, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
     if not u.active:
         return await call.answer("حسابك غير مفعّل", show_alert=True)
-    rows = (await session.execute(
-        select(TelegramAccount).where(
-            TelegramAccount.owner_user_id == u.id,
-            TelegramAccount.active == True
-        )
-    )).scalars().all()
+    rows, removed = await valid_accounts(session, u, settings)
     await call.answer()
-    await call.message.edit_text("👤 حساباتي\n\nالحسابات محفوظة حتى بعد إعادة تشغيل البوت.",
+    note = "\n\n⚠️ تم اكتشاف حساب Telegram خرج من الجلسات، فانحذفت جلسة دخوله من البوت. سجّل الدخول من جديد حتى تستخدمه." if removed else ""
+    await call.message.edit_text("👤 حساباتي\n\nالحسابات المحفوظة تبقى بعد إعادة تشغيل البوت." + note,
                                  reply_markup=accounts_kb(rows))
 
 @router.callback_query(F.data == "account_add")
@@ -180,11 +204,10 @@ async def destinations(call, session, settings):
 @router.callback_query(F.data == "dest_add")
 async def dest_add(call, state, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
-    accts = (await session.execute(
-        select(TelegramAccount).where(TelegramAccount.owner_user_id == u.id, TelegramAccount.active == True)
-    )).scalars().all()
+    accts, removed = await valid_accounts(session, u, settings)
     if not accts:
-        return await call.answer("أضف حساباً شخصياً أولاً", show_alert=True)
+        msg = "لا يوجد حساب Telegram صالح. أضف الحساب وسجّل الدخول من جديد." if removed else "أضف حساباً شخصياً أولاً"
+        return await call.answer(msg, show_alert=True)
     rows = [[InlineKeyboardButton(text=a.title, callback_data=f"dacc:{a.id}")] for a in accts]
     rows.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
     await state.set_state(DestFlow.account)
@@ -212,6 +235,8 @@ async def dest_chat(message, state, session, settings):
     ))).scalar_one_or_none()
     if not a:
         return await message.answer("الحساب غير موجود.")
+    if not await validate_account(session, a, settings):
+        return await message.answer("⚠️ جلسة حساب Telegram منتهية أو تم تسجيل خروجها. سجّل الدخول للحساب من جديد ثم أضف الكروب.")
     try:
         cid, title = await TelegramService(settings, settings.cipher).resolve_group(
             a.encrypted_session, (message.text or "").strip()
@@ -314,6 +339,9 @@ async def post_add(call, state, session, settings):
     u = await get_user(session, call.from_user.id, settings.owner_id)
     if not u.active:
         return await call.answer("حسابك غير مفعّل", show_alert=True)
+    accts, removed = await valid_accounts(session, u, settings)
+    if not accts:
+        return await call.answer("⚠️ لازم يكون عندك حساب Telegram صالح ومسجّل دخول. أضف الحساب من 👤 حساباتي.", show_alert=True)
     await state.set_state(PostFlow.draft)
     await call.answer()
     await call.message.edit_text(
@@ -345,11 +373,9 @@ async def post_account_text(message, state, session, settings):
     if (message.text or "").strip() != "اختيار الحساب":
         return await message.answer("اكتب: اختيار الحساب")
     u = await get_user(session, message.from_user.id, settings.owner_id)
-    accts = (await session.execute(select(TelegramAccount).where(
-        TelegramAccount.owner_user_id == u.id, TelegramAccount.active == True
-    ))).scalars().all()
+    accts, removed = await valid_accounts(session, u, settings)
     if not accts:
-        return await message.answer("لا توجد حسابات شخصية.")
+        return await message.answer("⚠️ لا توجد حسابات Telegram صالحة. سجّل الدخول من جديد.")
     rows = [[InlineKeyboardButton(text=f"📱 {a.title}", callback_data=f"postacct:{a.id}")]
             for a in accts]
     rows.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
@@ -361,6 +387,9 @@ async def post_account(call, state, session, settings):
     d = await state.get_data()
     account_id = int(call.data.split(":")[1])
     u = await get_user(session, call.from_user.id, settings.owner_id)
+    acct, removed = await get_valid_account(session, u, account_id, settings)
+    if not acct:
+        return await call.message.edit_text("⚠️ جلسة حساب Telegram منتهية. سجّل الدخول للحساب من جديد قبل استخدامه.", reply_markup=back())
     ds = (await session.execute(select(Destination).where(
         Destination.owner_user_id == u.id,
         Destination.account_id == account_id,
@@ -427,6 +456,10 @@ async def post_repeat(message, state, session, settings):
     if repeat < 0:
         return await message.answer("❌ الرقم لا يمكن أن يكون سالباً.")
     u = await get_user(session, message.from_user.id, settings.owner_id)
+    account, removed = await get_valid_account(session, u, d.get("account_id"), settings)
+    if not account:
+        await state.clear()
+        return await message.answer("⚠️ جلسة حساب Telegram منتهية. تم حذف جلسة الدخول من البوت. سجّل الحساب من جديد ثم أعد إنشاء النشر.")
     draft = await session.get(Draft, d["draft_id"])
     if not draft or not draft.active:
         return await message.answer("❌ المنشور المحفوظ غير موجود.")

@@ -8,6 +8,7 @@ from sqlalchemy import select
 from .db import User, Destination, Post, PostDestination, Schedule, ScheduleConfig, Draft
 from .states import PostFlow
 from .keyboards import main_menu
+from .account_guard import validate_account
 
 router = Router()
 
@@ -38,10 +39,19 @@ def fmt_seconds(lo, hi):
         return f'{x} ثانية'
     return f'كل {f(lo)}' if lo == hi else f'بين {f(lo)} و {f(hi)}'
 
-def running_kb(rows):
+def running_kb(rows, paused_rows=None):
     buttons = []
+    paused_rows = paused_rows or []
     for s, cfg in rows:
-        buttons.append([InlineKeyboardButton(text=f'⏸️ إيقاف #{s.id}', callback_data=f'stop_schedule:{s.id}')])
+        buttons.append([
+            InlineKeyboardButton(text=f'⏸️ مؤقت #{s.id}', callback_data=f'pause_schedule:{s.id}'),
+            InlineKeyboardButton(text=f'🛑 دائم #{s.id}', callback_data=f'permanent_stop:{s.id}')
+        ])
+    for s, cfg in paused_rows:
+        buttons.append([
+            InlineKeyboardButton(text=f'▶️ تشغيل #{s.id}', callback_data=f'resume_schedule:{s.id}'),
+            InlineKeyboardButton(text=f'🛑 دائم #{s.id}', callback_data=f'permanent_stop:{s.id}')
+        ])
     buttons.append([InlineKeyboardButton(text='⬅️ رجوع', callback_data='home')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -183,6 +193,15 @@ async def delete_post(call, session, settings):
 @router.message(PostFlow.destinations)
 async def new_destinations(message, state, session, settings):
     d = await state.get_data(); u = await _user(session, message.from_user.id, settings.owner_id)
+    from .db import TelegramAccount
+    account = (await session.execute(select(TelegramAccount).where(
+        TelegramAccount.id == d.get('account_id'),
+        TelegramAccount.owner_user_id == u.id,
+        TelegramAccount.active == True
+    ))).scalar_one_or_none()
+    if not account or not await validate_account(session, account, settings):
+        await state.clear()
+        return await message.answer('⚠️ جلسة حساب Telegram منتهية. تم حذف جلسة الدخول من البوت. سجّل الحساب من جديد ثم أعد إنشاء النشر.')
     try: ids = [int(x.strip()) for x in ar_num(message.text).split(',') if x.strip()]
     except Exception: return await message.answer('اكتب أرقام الكروبات مثل: 1,2')
     ds = (await session.execute(select(Destination).where(Destination.id.in_(ids), Destination.owner_user_id == u.id, Destination.account_id == d['account_id'], Destination.active == True))).scalars().all()
@@ -206,6 +225,15 @@ async def count(message, state, session, settings):
     except Exception: return await message.answer('❌ أرسل رقم المرات فقط. مثال: 10')
     if count < 0: return await message.answer('❌ العدد لا يمكن أن يكون سالباً.')
     d = await state.get_data(); u = await _user(session, message.from_user.id, settings.owner_id)
+    from .db import TelegramAccount
+    account = (await session.execute(select(TelegramAccount).where(
+        TelegramAccount.id == d.get('account_id'),
+        TelegramAccount.owner_user_id == u.id,
+        TelegramAccount.active == True
+    ))).scalar_one_or_none()
+    if not account or not await validate_account(session, account, settings):
+        await state.clear()
+        return await message.answer('⚠️ جلسة حساب Telegram منتهية. تم حذف جلسة الدخول من البوت. سجّل الحساب من جديد ثم أعد إنشاء النشر.')
     draft = await session.get(Draft, d.get('draft_id'))
     if not draft or not draft.active: return await message.answer('❌ المنشور المحفوظ غير موجود.')
     p = Post(owner_user_id=u.id, account_id=d['account_id'], text=draft.text, media_file_id=draft.media_file_id)
@@ -228,26 +256,115 @@ async def _user(session, tid, owner):
     return u
 
 async def _active(session, u):
-    return (await session.execute(select(Schedule, ScheduleConfig).join(Post, Schedule.post_id == Post.id).outerjoin(ScheduleConfig, ScheduleConfig.schedule_id == Schedule.id).where(Post.owner_user_id == u.id, Schedule.active == True))).all()
+    return (await session.execute(
+        select(Schedule, ScheduleConfig)
+        .join(Post, Schedule.post_id == Post.id)
+        .outerjoin(ScheduleConfig, ScheduleConfig.schedule_id == Schedule.id)
+        .where(Post.owner_user_id == u.id, Post.active == True, Schedule.active == True)
+        .order_by(Schedule.id.desc())
+    )).all()
+
+async def _paused(session, u):
+    return (await session.execute(
+        select(Schedule, ScheduleConfig)
+        .join(Post, Schedule.post_id == Post.id)
+        .outerjoin(ScheduleConfig, ScheduleConfig.schedule_id == Schedule.id)
+        .where(Post.owner_user_id == u.id, Post.active == True, Schedule.active == False, Schedule.interval_minutes != -1)
+        .order_by(Schedule.id.desc())
+    )).all()
+
+def _schedule_lines(rows):
+    parts = []
+    for s, c in rows:
+        if c:
+            limit = '∞' if c.publish_limit == 0 else f'{c.published_count}/{c.publish_limit}'
+            parts.append(f'#{s.id} — {fmt_seconds(c.min_interval_seconds, c.max_interval_seconds)} — {limit}')
+        else:
+            parts.append(f'#{s.id} — كل {s.interval_minutes} دقيقة')
+    return parts
+
+async def _render_running(call, session, u, prefix='▶️ إدارة النشر'):
+    active_rows = await _active(session, u)
+    paused_rows = await _paused(session, u)
+    parts = []
+    if active_rows:
+        parts.append('🟢 يعمل الآن:\n' + '\n'.join(_schedule_lines(active_rows)))
+    if paused_rows:
+        parts.append('\n⏸️ متوقف مؤقتاً:\n' + '\n'.join(_schedule_lines(paused_rows)))
+    if not parts:
+        text = '📭 لا توجد جدولات محفوظة قابلة للإدارة حالياً.'
+    else:
+        text = prefix + ':\n\n' + '\n'.join(parts) + '\n\n⏸️ مؤقت = توقف وتقدر ترجعه\n🛑 دائم = إيقاف نهائي لهذا النشر'
+    await call.message.edit_text(text, reply_markup=running_kb(active_rows, paused_rows))
 
 @router.callback_query(F.data.in_({'running','schedules'}))
 async def show_active(call, session, settings):
-    u = await _user(session, call.from_user.id, settings.owner_id); rows = await _active(session,u)
-    if not rows: text='⏸️ لا توجد منشورات نشطة حالياً.'
-    else:
-        parts=[]
-        for s,c in rows:
-            if c: parts.append(f'#{s.id} — {fmt_seconds(c.min_interval_seconds,c.max_interval_seconds)} — {"∞" if c.publish_limit==0 else f"{c.published_count}/{c.publish_limit}"}')
-            else: parts.append(f'#{s.id} — كل {s.interval_minutes} دقيقة')
-        text='▶️ النشر النشط:\n\n'+'\n'.join(parts)+'\n\nاضغط إيقاف لإيقاف أي منشور.'
-    await call.answer(); await call.message.edit_text(text, reply_markup=running_kb(rows))
+    u = await _user(session, call.from_user.id, settings.owner_id)
+    await call.answer()
+    await _render_running(call, session, u)
 
+@router.callback_query(F.data.startswith('pause_schedule:'))
+async def pause_schedule(call, session, settings):
+    u = await _user(session, call.from_user.id, settings.owner_id)
+    sid = int(call.data.split(':')[1])
+    sch = (await session.execute(
+        select(Schedule).join(Post, Schedule.post_id == Post.id).where(
+            Schedule.id == sid, Post.owner_user_id == u.id, Post.active == True, Schedule.active == True
+        )
+    )).scalar_one_or_none()
+    if not sch:
+        return await call.answer('الجدولة غير موجودة أو متوقفة.', show_alert=True)
+    sch.active = False
+    await session.commit()
+    await call.answer('⏸️ تم الإيقاف المؤقت')
+    await _render_running(call, session, u)
+
+@router.callback_query(F.data.startswith('resume_schedule:'))
+async def resume_schedule(call, session, settings):
+    u = await _user(session, call.from_user.id, settings.owner_id)
+    sid = int(call.data.split(':')[1])
+    sch = (await session.execute(
+        select(Schedule).join(Post, Schedule.post_id == Post.id).where(
+            Schedule.id == sid, Post.owner_user_id == u.id, Post.active == True, Schedule.active == False
+        )
+    )).scalar_one_or_none()
+    if not sch:
+        return await call.answer('الجدولة غير موجودة أو تعمل حالياً.', show_alert=True)
+    sch.active = True
+    sch.next_run_at = datetime.now().replace(microsecond=0)
+    await session.commit()
+    await call.answer('▶️ تم إرجاع النشر')
+    await _render_running(call, session, u)
+
+@router.callback_query(F.data.startswith('permanent_stop:'))
+async def permanent_stop(call, session, settings):
+    u = await _user(session, call.from_user.id, settings.owner_id)
+    sid = int(call.data.split(':')[1])
+    sch = (await session.execute(
+        select(Schedule).join(Post, Schedule.post_id == Post.id).where(
+            Schedule.id == sid, Post.owner_user_id == u.id, Post.active == True
+        )
+    )).scalar_one_or_none()
+    if not sch:
+        return await call.answer('الجدولة غير موجودة.', show_alert=True)
+    sch.active = False
+    # -1 علامة داخلية: إيقاف نهائي بدون حذف المنشور من إدارة المنشورات.
+    sch.interval_minutes = -1
+    await session.commit()
+    await call.answer('🛑 تم الإيقاف النهائي')
+    await _render_running(call, session, u)
+
+# التوافق مع الزر القديم إن وُجد في رسالة/نسخة قديمة من البوت.
 @router.callback_query(F.data.startswith('stop_schedule:'))
-async def stop_schedule(call, session, settings):
-    u = await _user(session, call.from_user.id, settings.owner_id); sid=int(call.data.split(':')[1])
-    sch=(await session.execute(select(Schedule).join(Post, Schedule.post_id==Post.id).where(Schedule.id==sid, Post.owner_user_id==u.id, Schedule.active==True))).scalar_one_or_none()
-    if not sch: return await call.answer('الجدولة غير موجودة أو متوقفة.', show_alert=True)
-    sch.active=False; await session.commit(); await call.answer('⏸️ تم إيقاف النشر')
-    rows=await _active(session,u)
-    text='⏸️ تم إيقاف النشر.\n\n'+('لا توجد منشورات نشطة حالياً.' if not rows else 'النشر النشط:')
-    await call.message.edit_text(text, reply_markup=running_kb(rows))
+async def stop_schedule_legacy(call, session, settings):
+    u = await _user(session, call.from_user.id, settings.owner_id)
+    sid = int(call.data.split(':')[1])
+    sch = (await session.execute(select(Schedule).join(Post, Schedule.post_id == Post.id).where(
+        Schedule.id == sid, Post.owner_user_id == u.id, Post.active == True
+    ))).scalar_one_or_none()
+    if not sch:
+        return await call.answer('الجدولة غير موجودة.', show_alert=True)
+    sch.active = False
+    await session.commit()
+    await call.answer('⏸️ تم الإيقاف المؤقت')
+    await _render_running(call, session, u)
